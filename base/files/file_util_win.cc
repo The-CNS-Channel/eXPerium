@@ -2,6 +2,10 @@
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file.
 
+#ifdef UNSAFE_BUFFERS_BUILD
+#pragma allow_unsafe_buffers
+#endif
+
 #include "base/files/file_util.h"
 
 #include <windows.h>
@@ -16,15 +20,14 @@
 #include <time.h>
 
 #include <algorithm>
-#include <array>
 #include <limits>
 #include <string>
-#include <string_view>
 #include <utility>
 #include <vector>
 
 #include "base/check.h"
 #include "base/clang_profiling_buildflags.h"
+#include "base/debug/alias.h"
 #include "base/feature_list.h"
 #include "base/features.h"
 #include "base/files/file_enumerator.h"
@@ -40,7 +43,7 @@
 #include "base/rand_util.h"
 #include "base/strings/strcat.h"
 #include "base/strings/string_number_conversions.h"
-#include "base/strings/string_split_win.h"
+#include "base/strings/string_piece.h"
 #include "base/strings/string_util.h"
 #include "base/strings/string_util_win.h"
 #include "base/strings/utf_string_conversions.h"
@@ -63,14 +66,12 @@ namespace {
 
 int g_extra_allowed_path_for_no_execute = 0;
 
-constexpr DWORD kFileShareAll =
-    FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE;
-constexpr std::wstring_view kDefaultTempDirPrefix = L"ChromiumTemp";
+bool g_disable_secure_system_temp_for_testing = false;
 
-// Returns the Win32 last error code or ERROR_SUCCESS if the last error code is
-// ERROR_FILE_NOT_FOUND or ERROR_PATH_NOT_FOUND. This is useful in cases where
-// the absence of a file or path is a success condition (e.g., when attempting
-// to delete an item in the filesystem).
+const DWORD kFileShareAll =
+    FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE;
+const wchar_t kDefaultTempDirPrefix[] = L"ChromiumTemp";
+
 DWORD ReturnLastErrorOrSuccessOnNotFound() {
   const DWORD error_code = ::GetLastError();
   return (error_code == ERROR_FILE_NOT_FOUND ||
@@ -79,10 +80,6 @@ DWORD ReturnLastErrorOrSuccessOnNotFound() {
              : error_code;
 }
 
-// Deletes all files and directories in a path.
-// Returns ERROR_SUCCESS on success or the Windows error code corresponding to
-// the first error encountered. ERROR_FILE_NOT_FOUND and ERROR_PATH_NOT_FOUND
-// are considered success conditions, and are therefore never returned.
 DWORD DeleteFileRecursive(const FilePath& path,
                           const FilePath::StringType& pattern,
                           bool recursive) {
@@ -92,7 +89,6 @@ DWORD DeleteFileRecursive(const FilePath& path,
   DWORD result = ERROR_SUCCESS;
   for (FilePath current = traversal.Next(); !current.empty();
        current = traversal.Next()) {
-    // Try to clear the read-only bit if we find it.
     FileEnumerator::FileInfo info = traversal.GetInfo();
     if ((info.find_data().dwFileAttributes & FILE_ATTRIBUTE_READONLY) &&
         (recursive || !info.IsDirectory())) {
@@ -121,8 +117,6 @@ DWORD DeleteFileRecursive(const FilePath& path,
   return result;
 }
 
-// Appends |mode_char| to |mode| before the optional character set encoding; see
-// https://msdn.microsoft.com/library/yeby3zcb.aspx for details.
 void AppendModeCharacter(wchar_t mode_char, std::wstring* mode) {
   size_t comma_pos = mode->find(L',');
   mode->insert(comma_pos == std::wstring::npos ? mode->length() : comma_pos, 1,
@@ -136,8 +130,6 @@ bool DoCopyFile(const FilePath& from_path,
   if (from_path.ReferencesParent() || to_path.ReferencesParent())
     return false;
 
-  // NOTE: I suspect we could support longer paths, but that would involve
-  // analyzing all our usage of files.
   if (from_path.value().length() >= MAX_PATH ||
       to_path.value().length() >= MAX_PATH) {
     return false;
@@ -147,10 +139,6 @@ bool DoCopyFile(const FilePath& from_path,
   // (http://crbug/973868).
   SCOPED_MAY_LOAD_LIBRARY_AT_BACKGROUND_PRIORITY();
 
-  // Unlike the posix implementation that copies the file manually and discards
-  // the ACL bits, CopyFile() copies the complete SECURITY_DESCRIPTOR and access
-  // bits, which is usually not what we want. We can't do much about the
-  // SECURITY_DESCRIPTOR but at least remove the read only bit.
   const wchar_t* dest = to_path.value().c_str();
   if (!::CopyFile(from_path.value().c_str(), dest, fail_if_exists)) {
     // Copy failed.
@@ -170,21 +158,13 @@ bool DoCopyDirectory(const FilePath& from_path,
                      const FilePath& to_path,
                      bool recursive,
                      bool fail_if_exists) {
-  // NOTE(maruel): Previous version of this function used to call
-  // SHFileOperation().  This used to copy the file attributes and extended
-  // attributes, OLE structured storage, NTFS file system alternate data
-  // streams, SECURITY_DESCRIPTOR. In practice, this is not what we want, we
-  // want the containing directory to propagate its SECURITY_DESCRIPTOR.
   ScopedBlockingCall scoped_blocking_call(FROM_HERE, BlockingType::MAY_BLOCK);
 
-  // NOTE: I suspect we could support longer paths, but that would involve
-  // analyzing all our usage of files.
   if (from_path.value().length() >= MAX_PATH ||
       to_path.value().length() >= MAX_PATH) {
     return false;
   }
 
-  // This function does not properly handle destinations within the source.
   FilePath real_to_path = to_path;
   if (PathExists(real_to_path)) {
     real_to_path = MakeAbsoluteFilePath(real_to_path);
@@ -211,7 +191,6 @@ bool DoCopyDirectory(const FilePath& from_path,
                 << from_path.value().c_str();
     return false;
   }
-  // TODO(maruel): This is not necessary anymore.
   DCHECK(recursive || DirectoryExists(from_path));
 
   FilePath current = from_path;
@@ -219,14 +198,10 @@ bool DoCopyDirectory(const FilePath& from_path,
   bool success = true;
   FilePath from_path_base = from_path;
   if (recursive && DirectoryExists(to_path)) {
-    // If the destination already exists and is a directory, then the
-    // top level of source needs to be copied.
     from_path_base = from_path.DirName();
   }
 
   while (success && !current.empty()) {
-    // current is the source path, including from_path, so append
-    // the suffix after from_path to to_path to create the target_path.
     FilePath target_path(to_path);
     if (from_path_base != current) {
       if (!from_path_base.AppendRelativePath(current, &target_path)) {
@@ -256,7 +231,6 @@ bool DoCopyDirectory(const FilePath& from_path,
   return success;
 }
 
-// Returns ERROR_SUCCESS on success, or a Windows error code on failure.
 DWORD DoDeleteFile(const FilePath& path, bool recursive) {
   ScopedBlockingCall scoped_blocking_call(FROM_HERE, BlockingType::MAY_BLOCK);
 
@@ -266,7 +240,6 @@ DWORD DoDeleteFile(const FilePath& path, bool recursive) {
   if (path.value().length() >= MAX_PATH)
     return ERROR_BAD_PATHNAME;
 
-  // Handle any path with wildcards.
   if (path.BaseName().value().find_first_of(FILE_PATH_LITERAL("*?")) !=
       FilePath::StringType::npos) {
     const DWORD error_code =
@@ -276,20 +249,16 @@ DWORD DoDeleteFile(const FilePath& path, bool recursive) {
     return error_code;
   }
 
-  // Report success if the file or path does not exist.
   const DWORD attr = ::GetFileAttributes(path.value().c_str());
   if (attr == INVALID_FILE_ATTRIBUTES)
     return ReturnLastErrorOrSuccessOnNotFound();
 
-  // Clear the read-only bit if it is set.
   if ((attr & FILE_ATTRIBUTE_READONLY) &&
       !::SetFileAttributes(path.value().c_str(),
                            attr & ~DWORD{FILE_ATTRIBUTE_READONLY})) {
-    // It's possible for |path| to be gone now under a race with other deleters.
     return ReturnLastErrorOrSuccessOnNotFound();
   }
 
-  // Perform a simple delete on anything that isn't a directory.
   if (!(attr & FILE_ATTRIBUTE_DIRECTORY)) {
     return ::DeleteFile(path.value().c_str())
                ? ERROR_SUCCESS
@@ -308,10 +277,6 @@ DWORD DoDeleteFile(const FilePath& path, bool recursive) {
              ? ERROR_SUCCESS
              : ReturnLastErrorOrSuccessOnNotFound();
 }
-
-// Deletes the file/directory at |path| (recursively if |recursive| and |path|
-// names a directory), returning true on success. Sets the Windows last-error
-// code and returns false on failure.
 bool DeleteFileOrSetLastError(const FilePath& path, bool recursive) {
   const DWORD error = DoDeleteFile(path, recursive);
   if (error == ERROR_SUCCESS)
@@ -327,14 +292,9 @@ void DeleteFileWithRetry(const FilePath& path,
                          bool recursive,
                          int attempt,
                          OnceCallback<void(bool)> reply_callback) {
-  // Retry every 250ms for up to two seconds. These values were pulled out of
-  // thin air, and may be adjusted in the future based on the metrics collected.
   static constexpr TimeDelta kDeleteFileRetryDelay = Milliseconds(250);
 
   if (DeleteFileOrSetLastError(path, recursive)) {
-    // Consider introducing further retries until the item has been removed from
-    // the filesystem and its name is ready for reuse; see the comments in
-    // chrome/installer/mini_installer/delete_with_retry.cc for details.
     if (!reply_callback.is_null())
       std::move(reply_callback).Run(true);
     return;
@@ -368,19 +328,8 @@ OnceClosure GetDeleteFileCallbackInternal(
                   std::move(bound_callback));
 }
 
-// This function verifies that no code is attempting to set an ACL on a file
-// that is outside of 'safe' paths. A 'safe' path is defined as one that is
-// within the user data dir, or the temporary directory. This is explicitly to
-// prevent code from trying to pass a writeable handle to a file outside of
-// these directories to an untrusted process. E.g. if some future code created a
-// writeable handle to a file in c:\users\user\sensitive.dat, this DCHECK would
-// hit. Setting an ACL on a file outside of these chrome-controlled directories
-// might cause the browser or operating system to fail in unexpected ways.
 bool IsPathSafeToSetAclOn(const FilePath& path) {
 #if BUILDFLAG(CLANG_PROFILING)
-  // TODO(crbug.com/329482479) Use PreventExecuteMappingUnchecked for .profraw.
-  // Ignore .profraw profiling files, as they can occur anywhere, and only occur
-  // during testing.
   if (path.Extension() == FILE_PATH_LITERAL(".profraw")) {
     return true;
   }
@@ -390,8 +339,6 @@ bool IsPathSafeToSetAclOn(const FilePath& path) {
     valid_path_keys.push_back(g_extra_allowed_path_for_no_execute);
   }
 
-  // MakeLongFilePath is needed here because temp files can have an 8.3 path
-  // under certain conditions. See comments in base::MakeLongFilePath.
   FilePath long_path = MakeLongFilePath(path);
   DCHECK(!long_path.empty()) << "Cannot get long path for " << path;
 
@@ -404,18 +351,12 @@ bool IsPathSafeToSetAclOn(const FilePath& path) {
     }
     valid_paths.push_back(valid_path);
   }
-
-  // Admin users create temporary files in SystemTemp; see
-  // `CreateNewTempDirectory` below.
   FilePath secure_system_temp;
-  if (::IsUserAnAdmin() &&
-      PathService::Get(DIR_SYSTEM_TEMP, &secure_system_temp)) {
+  if (::IsUserAnAdmin() && GetSecureSystemTemp(&secure_system_temp)) {
     valid_paths.push_back(secure_system_temp);
   }
 
   for (const auto& valid_path : valid_paths) {
-    // Temp files can sometimes have an 8.3 path. See comments in
-    // `MakeLongFilePath`.
     FilePath full_path = MakeLongFilePath(valid_path);
     DCHECK(!full_path.empty()) << "Cannot get long path for " << valid_path;
     if (full_path.IsParent(long_path)) {
@@ -426,7 +367,7 @@ bool IsPathSafeToSetAclOn(const FilePath& path) {
   return false;
 }
 
-}  // namespace
+}
 
 OnceClosure GetDeleteFileCallback(const FilePath& path,
                                   OnceCallback<void(bool)> reply_callback) {
@@ -471,11 +412,14 @@ bool ReplaceFile(const FilePath& from_path,
                  const FilePath& to_path,
                  File::Error* error) {
   ScopedBlockingCall scoped_blocking_call(FROM_HERE, BlockingType::MAY_BLOCK);
+  FilePath::CharType from_path_str[MAX_PATH];
+  base::wcslcpy(from_path_str, from_path.value().c_str(),
+                std::size(from_path_str));
+  base::debug::Alias(from_path_str);
+  FilePath::CharType to_path_str[MAX_PATH];
+  base::wcslcpy(to_path_str, to_path.value().c_str(), std::size(to_path_str));
+  base::debug::Alias(to_path_str);
 
-  // Assume that |to_path| already exists and try the normal replace. This will
-  // fail with ERROR_FILE_NOT_FOUND if |to_path| does not exist. When writing to
-  // a network share, we may not be able to change the ACLs. Ignore ACL errors
-  // then (REPLACEFILE_IGNORE_MERGE_ERRORS).
   if (::ReplaceFile(to_path.value().c_str(), from_path.value().c_str(), NULL,
                     REPLACEFILE_IGNORE_MERGE_ERRORS, NULL, NULL)) {
     return true;
@@ -483,14 +427,9 @@ bool ReplaceFile(const FilePath& from_path,
 
   File::Error replace_error = File::OSErrorToFileError(GetLastError());
 
-  // Try a simple move next. It will only succeed when |to_path| doesn't already
-  // exist.
   if (::MoveFile(from_path.value().c_str(), to_path.value().c_str()))
     return true;
 
-  // In the case of FILE_ERROR_NOT_FOUND from ReplaceFile, it is likely that
-  // |to_path| does not exist. In this case, the more relevant error comes
-  // from the call to MoveFile.
   if (error) {
     *error = replace_error == File::FILE_ERROR_NOT_FOUND
                  ? File::GetLastFileError()
@@ -541,7 +480,7 @@ bool PathHasAccess(const FilePath& path,
   return file.is_valid();
 }
 
-}  // namespace
+}
 
 bool PathIsReadable(const FilePath& path) {
   return PathHasAccess(path, FILE_LIST_DIRECTORY, GENERIC_READ);
@@ -564,9 +503,6 @@ bool GetTempDir(FilePath* path) {
   DWORD path_len = ::GetTempPath(MAX_PATH, temp_path);
   if (path_len >= MAX_PATH || path_len <= 0)
     return false;
-  // TODO(evanm): the old behavior of this function was to always strip the
-  // trailing slash.  We duplicate this here, but it shouldn't be necessary
-  // when everyone is using the appropriate FilePath APIs.
   *path = FilePath(temp_path).StripTrailingSeparators();
   return true;
 }
@@ -578,32 +514,18 @@ FilePath GetHomeDir() {
       result[0]) {
     return FilePath(result);
   }
-
-  // Fall back to the temporary directory on failure.
-  FilePath temp;
   if (GetTempDir(&temp))
     return temp;
-
-  // Last resort.
   return FilePath(FILE_PATH_LITERAL("C:\\"));
 }
 
 File CreateAndOpenTemporaryFileInDir(const FilePath& dir, FilePath* temp_file) {
   ScopedBlockingCall scoped_blocking_call(FROM_HERE, BlockingType::MAY_BLOCK);
 
-  // Open the file with exclusive r/w/d access, and allow the caller to decide
-  // to mark it for deletion upon close after the fact.
   constexpr uint32_t kFlags = File::FLAG_CREATE | File::FLAG_READ |
                               File::FLAG_WRITE | File::FLAG_WIN_EXCLUSIVE_READ |
                               File::FLAG_WIN_EXCLUSIVE_WRITE |
                               File::FLAG_CAN_DELETE_ON_CLOSE;
-
-  // Use GUID instead of ::GetTempFileName() to generate unique file names.
-  // "Due to the algorithm used to generate file names, GetTempFileName can
-  // perform poorly when creating a large number of files with the same prefix.
-  // In such cases, it is recommended that you construct unique file names based
-  // on GUIDs."
-  // https://msdn.microsoft.com/library/windows/desktop/aa364991.aspx
 
   FilePath temp_name;
   File file;
@@ -655,7 +577,7 @@ ScopedFILE CreateAndOpenTemporaryStreamInDir(const FilePath& dir,
 }
 
 bool CreateTemporaryDirInDir(const FilePath& base_dir,
-                             FilePath::StringPieceType prefix,
+                             const FilePath::StringType& prefix,
                              FilePath* new_dir) {
   ScopedBlockingCall scoped_blocking_call(FROM_HERE, BlockingType::MAY_BLOCK);
 
@@ -681,15 +603,48 @@ bool CreateTemporaryDirInDir(const FilePath& base_dir,
   return false;
 }
 
-// The directory is created under SystemTemp for security reasons if the caller
-// is admin to avoid attacks from lower privilege processes.
+bool GetSecureSystemTemp(FilePath* temp) {
+  if (g_disable_secure_system_temp_for_testing) {
+    return false;
+  }
+
+  ScopedBlockingCall scoped_blocking_call(FROM_HERE, BlockingType::MAY_BLOCK);
+
+  CHECK(temp);
+
+  for (const auto key : {DIR_WINDOWS, DIR_IE_INTERNET_CACHE, DIR_PROGRAM_FILES}) {
+    FilePath secure_system_temp;
+    if (!PathService::Get(key, &secure_system_temp)) {
+      continue;
+    }
+
+    if (key == DIR_WINDOWS) {
+      secure_system_temp = secure_system_temp.AppendASCII("SystemTemp");
+    }
+
+    if (PathExists(secure_system_temp) && PathIsWritable(secure_system_temp)) {
+      *temp = secure_system_temp;
+      return true;
+    }
+  }
+
+  return false;
+}
+
+void SetDisableSecureSystemTempForTesting(bool disabled) {
+  g_disable_secure_system_temp_for_testing = disabled;
+}
+
+// The directory is created under `GetSecureSystemTemp` for security reasons if
+// the caller is admin to avoid attacks from lower privilege processes.
 //
-// If unable to create a dir under SystemTemp, the dir is created under
-// %TEMP%. The reasons for not being able to create a dir under SystemTemp could
-// be because `%systemroot%\SystemTemp` does not exist, or unable to resolve
-// `DIR_WINDOWS` or `DIR_PROGRAM_FILES`, say due to registry redirection, or
-// unable to create a directory due to SystemTemp being read-only or having
-// atypical ACLs. An override of `DIR_SYSTEM_TEMP` by tests will be respected.
+// If unable to create a dir under `GetSecureSystemTemp`, the dir is created
+// under %TEMP%. The reasons for not being able to create a dir under
+// `GetSecureSystemTemp` could be because `%systemroot%\SystemTemp` does not
+// exist, or unable to resolve `DIR_WINDOWS` or `DIR_PROGRAM_FILES`, say due to
+// registry redirection, or unable to create a directory due to
+// `GetSecureSystemTemp` being read-only or having atypical ACLs. Tests can also
+// disable this behavior resulting in false being returned.
 bool CreateNewTempDirectory(const FilePath::StringType& prefix,
                             FilePath* new_temp_path) {
   ScopedBlockingCall scoped_blocking_call(FROM_HERE, BlockingType::MAY_BLOCK);
@@ -697,7 +652,7 @@ bool CreateNewTempDirectory(const FilePath::StringType& prefix,
   DCHECK(new_temp_path);
 
   FilePath parent_dir;
-  if (::IsUserAnAdmin() && PathService::Get(DIR_SYSTEM_TEMP, &parent_dir) &&
+  if (::IsUserAnAdmin() && GetSecureSystemTemp(&parent_dir) &&
       CreateTemporaryDirInDir(parent_dir,
                               prefix.empty() ? kDefaultTempDirPrefix : prefix,
                               new_temp_path)) {
@@ -767,40 +722,30 @@ bool CreateDirectoryAndGetError(const FilePath& full_path,
 
 bool NormalizeFilePath(const FilePath& path, FilePath* real_path) {
   ScopedBlockingCall scoped_blocking_call(FROM_HERE, BlockingType::MAY_BLOCK);
-
-  File file(path, File::FLAG_OPEN | File::FLAG_READ |
-                      File::FLAG_WIN_SHARE_DELETE |
-                      File::FLAG_WIN_BACKUP_SEMANTICS);
-  if (!file.IsValid()) {
+  File file(path,
+            File::FLAG_OPEN | File::FLAG_READ | File::FLAG_WIN_SHARE_DELETE);
+  if (!file.IsValid())
     return false;
-  }
 
-  // The expansion of `path` into a full path may make it longer. Since
-  // '\Device\HarddiskVolume1' is 23 characters long, we can add 30 characters.
-  constexpr int kMaxPathLength = MAX_PATH + 30;
+  // The expansion of |path| into a full path may make it longer.
+  constexpr int kMaxPathLength = MAX_PATH + 10;
   wchar_t native_file_path[kMaxPathLength];
   // On success, `used_wchars` returns the number of written characters, not
-  // including the trailing '\0'. Thus, failure is indicated by returning 0 or
-  // >= kMaxPathLength.
+  // include the trailing '\0'. Thus, failure is indicated by returning 0 or >=
+  // kMaxPathLength.
   DWORD used_wchars = ::GetFinalPathNameByHandle(
       file.GetPlatformFile(), native_file_path, kMaxPathLength,
       FILE_NAME_NORMALIZED | VOLUME_NAME_NT);
-  if (used_wchars >= kMaxPathLength || used_wchars == 0) {
-    return false;
-  }
 
-  // With `VOLUME_NAME_NT` flag, GetFinalPathNameByHandle() returns the path
-  // with the volume device path and existing code expects we return a path
-  // starting 'X:\' so we need to call DevicePathToDriveLetterPath.
-  if (!DevicePathToDriveLetterPath(
-          FilePath(FilePath::StringPieceType(native_file_path, used_wchars)),
-          real_path)) {
+  if (used_wchars >= kMaxPathLength || used_wchars == 0)
     return false;
-  }
 
-  // `real_path` can be longer than MAX_PATH and we should only return paths
-  // that are less than MAX_PATH.
-  return real_path->value().size() <= MAX_PATH;
+  // GetFinalPathNameByHandle() returns the \\?\ syntax for file names and
+  // existing code expects we return a path starting 'X:\' so we call
+  // DevicePathToDriveLetterPath rather than using VOLUME_NAME_DOS above.
+  return DevicePathToDriveLetterPath(
+      FilePath(FilePath::StringPieceType(native_file_path, used_wchars)),
+      real_path);
 }
 
 bool DevicePathToDriveLetterPath(const FilePath& nt_device_path,
@@ -808,34 +753,26 @@ bool DevicePathToDriveLetterPath(const FilePath& nt_device_path,
   ScopedBlockingCall scoped_blocking_call(FROM_HERE, BlockingType::MAY_BLOCK);
 
   // Get the mapping of drive letters to device paths.
-  // Note: There are 26 letters possible, and each entry takes 4 characters of
-  // space (e.g. ['C', ':', '\\', '\0'] plus an additional NUL character at the
-  // end, meaning 128 is safely above the maximum possible size needed).
-  std::array<wchar_t, 128> drive_strings_buffer = {};
-  DWORD count = ::GetLogicalDriveStrings(drive_strings_buffer.size() - 1u,
-                                         drive_strings_buffer.data());
-  CHECK_LT(count, drive_strings_buffer.size());
-  if (!count) {
-    DLOG(ERROR) << "Failed to get drive mapping";
+  const int kDriveMappingSize = 1024;
+  wchar_t drive_mapping[kDriveMappingSize] = {'\0'};
+  if (!::GetLogicalDriveStrings(kDriveMappingSize - 1, drive_mapping)) {
+    DLOG(ERROR) << "Failed to get drive mapping.";
     return false;
   }
-  // Truncate the buffer to the bytes actually copied by GetLogicalDriveStrings.
-  // Note: This gets rid of the superfluous NUL character at the end. Thus,
-  // `drive_strings` is now a sequence of null terminated strings.
-  std::wstring_view drive_strings(drive_strings_buffer.data(), count);
+
+  // The drive mapping is a sequence of null terminated strings.
+  // The last string is empty.
+  wchar_t* drive_map_ptr = drive_mapping;
+  wchar_t device_path_as_string[MAX_PATH];
+  wchar_t drive[] = FILE_PATH_LITERAL(" :");
 
   // For each string in the drive mapping, get the junction that links
   // to it.  If that junction is a prefix of |device_path|, then we
   // know that |drive| is the real path prefix.
-  for (std::wstring_view drive_string : base::SplitStringPiece(
-           drive_strings, base::MakeStringViewWithNulChars(L"\0"),
-           base::TRIM_WHITESPACE, base::SPLIT_WANT_NONEMPTY)) {
-    wchar_t drive[] = L" :";
-    drive[0u] = drive_string[0u];  // Copy the drive letter.
+  while (*drive_map_ptr) {
+    drive[0] = drive_map_ptr[0];  // Copy the drive letter.
 
-    wchar_t device_path_as_string[MAX_PATH];
-    if (::QueryDosDevice(drive, device_path_as_string,
-                         std::size(device_path_as_string))) {
+    if (QueryDosDevice(drive, device_path_as_string, MAX_PATH)) {
       FilePath device_path(device_path_as_string);
       if (device_path == nt_device_path ||
           device_path.IsParent(nt_device_path)) {
@@ -845,6 +782,9 @@ bool DevicePathToDriveLetterPath(const FilePath& nt_device_path,
         return true;
       }
     }
+    // Move to the next drive letter string, which starts one
+    // increment after the '\0' that terminates the current string.
+    while (*drive_map_ptr++) {}
   }
 
   // No drive matched.  The path does not start with a device junction
@@ -894,8 +834,6 @@ bool GetFileInfo(const FilePath& file_path, File::Info* results) {
   ULARGE_INTEGER size;
   size.HighPart = attr.nFileSizeHigh;
   size.LowPart = attr.nFileSizeLow;
-  // TODO(crbug.com/40227936): Change Info::size to uint64_t and eliminate this
-  // cast.
   results->size = checked_cast<int64_t>(size.QuadPart);
 
   results->is_directory =
@@ -967,8 +905,6 @@ std::optional<uint64_t> ReadFile(const FilePath& filename, span<char> buffer) {
     return std::nullopt;
   }
 
-  // TODO(crbug.com/40227936): Consider supporting reading more than INT_MAX
-  // bytes.
   DWORD bytes_to_read = static_cast<DWORD>(checked_cast<int>(buffer.size()));
 
   DWORD bytes_read;
@@ -979,32 +915,30 @@ std::optional<uint64_t> ReadFile(const FilePath& filename, span<char> buffer) {
   return bytes_read;
 }
 
-bool WriteFile(const FilePath& filename, span<const uint8_t> data) {
+int WriteFile(const FilePath& filename, const char* data, int size) {
   ScopedBlockingCall scoped_blocking_call(FROM_HERE, BlockingType::MAY_BLOCK);
   win::ScopedHandle file(CreateFile(filename.value().c_str(), GENERIC_WRITE, 0,
                                     NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL,
                                     NULL));
-  if (!file.is_valid()) {
+  if (!file.is_valid() || size < 0) {
     DPLOG(WARNING) << "WriteFile failed for path " << filename.value();
-    return false;
+    return -1;
   }
 
   DWORD written;
-  DWORD size = checked_cast<DWORD>(data.size());
-  BOOL result = ::WriteFile(file.get(), data.data(), size, &written, nullptr);
-  if (result && written == size) {
-    return true;
-  }
+  BOOL result =
+      ::WriteFile(file.get(), data, static_cast<DWORD>(size), &written, NULL);
+  if (result && static_cast<int>(written) == size)
+    return static_cast<int>(written);
 
   if (!result) {
-    // WriteFile failed.
     DPLOG(WARNING) << "writing file " << filename.value() << " failed";
   } else {
     // Didn't write all the bytes.
     DLOG(WARNING) << "wrote" << written << " bytes to " << filename.value()
                   << " expected " << size;
   }
-  return false;
+  return -1;
 }
 
 bool AppendToFile(const FilePath& filename, span<const uint8_t> data) {
@@ -1033,7 +967,7 @@ bool AppendToFile(const FilePath& filename, span<const uint8_t> data) {
   return false;
 }
 
-bool AppendToFile(const FilePath& filename, std::string_view data) {
+bool AppendToFile(const FilePath& filename, StringPiece data) {
   return AppendToFile(filename, as_bytes(make_span(data)));
 }
 
@@ -1045,9 +979,6 @@ bool GetCurrentDirectory(FilePath* dir) {
   DWORD len = ::GetCurrentDirectory(MAX_PATH, system_buffer);
   if (len == 0 || len > MAX_PATH)
     return false;
-  // TODO(evanm): the old behavior of this function was to always strip the
-  // trailing slash.  We duplicate this here, but it shouldn't be necessary
-  // when everyone is using the appropriate FilePath APIs.
   *dir = FilePath(FilePath::StringPieceType(system_buffer))
              .StripTrailingSeparators();
   return true;
