@@ -2,4 +2,4 @@
 
 
       eXPerium is an open-source browser project that aims to build a better,
-safer way for all XP users to experience the internet.
+      safer way for all XP users to experience the internet.
