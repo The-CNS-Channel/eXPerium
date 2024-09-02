@@ -1,4 +1,4 @@
-// Copyright 2018 The Chromium Authors
+// Copyright 2018-2024 The Chromium Authors and 2024 The CNS Channel
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file.
 
@@ -7,14 +7,25 @@
 
 #include <cstdint>
 
-#include "partition_alloc/buildflags.h"
 #include "partition_alloc/oom.h"
 #include "partition_alloc/page_allocator.h"
 #include "partition_alloc/page_allocator_internal.h"
 #include "partition_alloc/partition_alloc_base/notreached.h"
+#include "partition_alloc/partition_alloc_buildflags.h"
 #include "partition_alloc/partition_alloc_check.h"
 
 namespace partition_alloc::internal {
+
+namespace {
+
+// On Windows, discarded pages are not returned to the system immediately and
+// not guaranteed to be zeroed when returned to the application.
+using DiscardVirtualMemoryFunction = DWORD(WINAPI*)(PVOID virtualAddress,
+                                                    SIZE_T size);
+DiscardVirtualMemoryFunction s_discard_virtual_memory =
+    reinterpret_cast<DiscardVirtualMemoryFunction>(-1);
+
+}  // namespace
 
 // |VirtualAlloc| will fail if allocation at the hint address is blocked.
 constexpr bool kHintIsAdvisory = false;
@@ -227,12 +238,20 @@ bool TryRecommitSystemPagesInternal(
 }
 
 void DiscardSystemPagesInternal(uintptr_t address, size_t length) {
+  if (s_discard_virtual_memory ==
+      reinterpret_cast<DiscardVirtualMemoryFunction>(-1)) {
+      s_discard_virtual_memory =
+          reinterpret_cast<DiscardVirtualMemoryFunction>(GetProcAddress(
+              GetModuleHandle(L"Kernel32.dll"), "DiscardVirtualMemory"));
+  }
+
   void* ptr = reinterpret_cast<void*>(address);
   // Use DiscardVirtualMemory when available because it releases faster than
   // MEM_RESET.
-  DWORD ret = DiscardVirtualMemory(ptr, length);
-  // DiscardVirtualMemory is buggy in Win10 SP0, so fall back to MEM_RESET on
-  // failure.
+  DWORD ret = 1;
+  if (s_discard_virtual_memory) {
+    ret = s_discard_virtual_memory(ptr, length);
+  }
   if (ret) {
     PA_CHECK(VirtualAllocWithRetry(ptr, length, MEM_RESET, PAGE_READWRITE));
   }
